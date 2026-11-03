@@ -28,7 +28,9 @@ async function rpc(fn, args = {}) {
   if (/^eyJ/.test(CFG.supabaseKey)) headers.Authorization = 'Bearer ' + CFG.supabaseKey;
   let r;
   try {
-    r = await fetch(`${CFG.supabaseUrl.replace(/\/+$/, '')}/rest/v1/rpc/${fn}`, { method: 'POST', headers, body: JSON.stringify(args) });
+    // 只取协议+域名，容错用户粘贴了 .../rest/v1/ 之类的完整地址
+    const base = (CFG.supabaseUrl.trim().match(/^https?:\/\/[^/]+/) || [''])[0];
+    r = await fetch(`${base}/rest/v1/rpc/${fn}`, { method: 'POST', headers, body: JSON.stringify(args) });
   } catch { throw new Error('无法连接数据库，请检查网络'); }
   const data = await r.json().catch(() => null);
   if (!r.ok) {
