@@ -59,6 +59,9 @@ const API = {
   users: () => rpc('relay_admin_list_users', { p_token: tk() }),
   updateUser: (name, patch) => rpc('relay_admin_update_user', { p_token: tk(), p_name: name, ...patch }),
   exportAll: () => rpc('relay_admin_export', { p_token: tk() }),
+  rename: newName => rpc('relay_change_username', { p_token: tk(), p_new_name: newName }),
+  adminRename: (name, newName) => rpc('relay_admin_rename_user', { p_token: tk(), p_name: name, p_new_name: newName }),
+  adminSave: (id, title, content) => rpc('relay_admin_save_node', { p_token: tk(), p_id: id, p_title: title, p_content: content }),
 };
 
 let toastTimer;
@@ -84,7 +87,7 @@ function renderNav() {
   if (me) {
     if (me.admin) h += `<a href="#/admin">管理</a>`;
     h += `<span><span class="who">${esc(me.name)}</span> ${me.admin ? '<span class="tag">管理员</span>' : me.verified ? '<span class="tag ok">已认证</span>' : '<span class="tag warn">待认证</span>'}</span>`;
-    h += `<a href="#/password">改密码</a><button class="linkbtn" id="logout">退出</button>`;
+    h += `<a href="#/account">账号设置</a><button class="linkbtn" id="logout">退出</button>`;
   } else {
     h += `<a href="#/login">登录</a><a href="#/register">注册</a>`;
   }
@@ -114,7 +117,8 @@ async function route() {
     if ((m = /^\/node\/(\d+)$/.exec(h))) return await showNode(Number(m[1]));
     if ((m = /^\/read\/(\d+)$/.exec(h))) return await showChain(Number(m[1]));
     if (h === '/login' || h === '/register') return showAuth(h.slice(1));
-    if (h === '/password') return showPassword();
+    if (h === '/account' || h === '/password') return showAccount();
+    if ((m = /^\/edit\/(\d+)$/.exec(h))) return await showNode(Number(m[1]), true);
     if (h === '/admin') return await showAdmin();
     location.hash = '#/';
   } catch (e) {
@@ -292,11 +296,15 @@ async function showTree() {
 }
 
 // ============ 节点 ============
-async function showNode(id) {
+async function showNode(id, adminEdit = false) {
   const n = await API.node(id);
   const depth = depthOf(id) + 1;
   const isOwner = me && n.owner === me.name;
-  const editable = isOwner && n.state === 'yellow';
+  const ownerEdit = isOwner && n.state === 'yellow';
+  // 管理员编辑模式：非认领者本人正在写的节点，管理员可改标题和正文（含已完成/已终止）
+  const canAdminEdit = !!me?.admin && n.state !== 'white' && !ownerEdit;
+  if (adminEdit && !canAdminEdit) { location.replace(`#/node/${id}`); return; }
+  const editable = ownerEdit || adminEdit;
   document.title = `${n.title || '第' + depth + '棒'} · 接龙之树`;
 
   let actions = '';
@@ -307,9 +315,15 @@ async function showNode(id) {
     else actions += `<button class="btn primary" id="claim">认领这一棒</button>`;
   }
   if (n.state === 'yellow' && !isOwner) notice = `@${esc(n.owner)} 正在写这一棒，完成前内容可能还会变动。`;
-  if (n.state === 'yellow' && me?.admin && !isOwner) actions += `<button class="btn red small" id="release">强制释放</button>`;
+  if (n.state === 'yellow' && me?.admin && !isOwner && !adminEdit) actions += `<button class="btn red small" id="release">强制释放</button>`;
   if (n.state === 'green') notice = `这一棒已完成，下一棒已开放。`;
   if (n.state === 'red') notice = `此分支在这一棒终止。`;
+  if (canAdminEdit && !adminEdit) actions += `<a class="btn" href="#/edit/${id}">管理员编辑</a>`;
+  if (adminEdit) {
+    notice = `你正在以<b>管理员</b>身份编辑这一棒，状态和认领者不会改变。` +
+      (n.state === 'yellow' ? `<br>注意：@${esc(n.owner)} 仍在写作中，双方同时编辑时，后保存的会覆盖先保存的。` : '');
+    actions = `<a class="btn" href="#/node/${id}">完成编辑</a>`;
+  }
 
   const crumbs = `<a href="#/">树</a> › 第 ${depth} 棒 <span style="color:#b0a796">#${id}</span>` +
     (n.parent ? ` · 接自 <a href="#/node/${n.parent.id}">${esc(n.parent.title || '第' + (depth - 1) + '棒')}</a>` : '');
@@ -337,10 +351,10 @@ async function showNode(id) {
     try { await API.release(id); toast('已释放'); route(); } catch (e) { toast(e.message); }
   });
 
-  if (editable) renderEditor(n);
+  if (editable) renderEditor(n, adminEdit);
   else if (n.state !== 'white') $('#body').innerHTML = `<article class="prose">${n.content.trim() ? renderMarkdown(n.content) : '<p class="empty">（还没有内容）</p>'}</article>`;
 
-  if (n.state === 'green') {
+  if (n.state === 'green' && !adminEdit) {
     $('#kids').innerHTML = `<div class="kids"><h3>下一棒</h3><div class="kid-grid">${n.children.map((c, i) => `
       <a class="kid ${c.state}" href="#/node/${c.id}">
         <span class="chip ${c.state}">${STATE_NAME[c.state]}</span>
@@ -350,8 +364,9 @@ async function showNode(id) {
   }
 }
 
-function renderEditor(n) {
+function renderEditor(n, adminMode = false) {
   const id = n.id;
+  const saveFn = adminMode ? API.adminSave : API.save;
   $('#h-title').outerHTML = `<input class="input title-input" id="title" maxlength="60" placeholder="给这一棒起个标题" value="${esc(n.title)}" style="margin:6px 0 8px;min-width:min(480px,80vw)">`;
   $('#body').innerHTML = `<div class="editor">
     <div class="tabs"><button class="btn small" id="t-edit">编辑</button><button class="btn small" id="t-prev">预览</button></div>
@@ -361,16 +376,16 @@ function renderEditor(n) {
     </div>
     <div class="editor-foot">
       <span class="save-state" id="ss">已保存 ${fmtTime(n.updatedAt)}</span>
-      <div class="actions"><button class="btn" id="giveup">放弃认领</button><button class="btn primary" id="save">保存（Ctrl+S）</button></div>
+      <div class="actions">${adminMode ? '' : '<button class="btn" id="giveup">放弃认领</button>'}<button class="btn primary" id="save">保存（Ctrl+S）</button></div>
     </div>
-    <div class="finish">
+    ${adminMode ? '' : `<div class="finish">
       <h3>写完了？</h3>
       <p>完成后这一棒将永久锁定，任何人都不能再修改。</p>
       <div class="actions">
         <button class="btn green" id="go-green">标绿 · 完成并开放下一棒（两个空位）</button>
         <button class="btn red" id="go-red">标红 · 此支到此为止</button>
       </div>
-    </div>
+    </div>`}
   </div>`;
   const ta = $('#content'), ti = $('#title'), pv = $('#preview'), ss = $('#ss');
   let saved = { title: n.title, content: n.content };
@@ -388,7 +403,7 @@ function renderEditor(n) {
     saving = true;
     const body = { title: ti.value, content: ta.value };
     try {
-      const r = await API.save(id, body.title, body.content);
+      const r = await saveFn(id, body.title, body.content);
       saved = body; ss.textContent = '已保存 ' + fmtTime(r.updatedAt); refresh();
       if (!quiet) toast('已保存');
       return true;
@@ -405,6 +420,7 @@ function renderEditor(n) {
 
   leaveGuard = () => !dirty();
   cleanup = () => { clearTimeout(timer); document.removeEventListener('keydown', onKey); };
+  if (adminMode) return;
 
   $('#giveup').onclick = async () => {
     if (!await confirmBox('放弃认领', '这一棒会变回<b>待认领</b>，你写的内容将被<b>清空</b>，其他人可以认领。', '放弃', 'red')) return;
@@ -470,16 +486,34 @@ function showAuth(mode) {
   };
 }
 
-function showPassword() {
+function showAccount() {
   if (!me) { location.hash = '#/login'; return; }
-  view.innerHTML = `<div class="auth"><h1>修改密码</h1><form id="f">
-    <input class="input" name="old" type="password" placeholder="原密码" autocomplete="current-password" required>
-    <input class="input" name="password" type="password" placeholder="新密码（至少 6 位）" autocomplete="new-password" required>
-    <button class="btn primary">保存</button></form></div>`;
-  $('#f').onsubmit = async e => {
+  view.innerHTML = `<div class="auth">
+    <h1>账号设置</h1>
+    <h3 style="margin:0 0 8px;font-size:15px">修改用户名</h3>
+    <form id="fn">
+      <input class="input" name="name" placeholder="新用户名" value="${esc(me.name)}" autocomplete="username" required>
+      <button class="btn primary">保存用户名</button>
+    </form>
+    <p class="meta" style="font-size:13px;margin:8px 0 0">改名后，你认领过的所有节点上显示的名字会一起更新，登录时请使用新用户名。</p>
+    <h3 style="margin:32px 0 8px;font-size:15px">修改密码</h3>
+    <form id="fp">
+      <input class="input" name="old" type="password" placeholder="原密码" autocomplete="current-password" required>
+      <input class="input" name="password" type="password" placeholder="新密码（至少 6 位）" autocomplete="new-password" required>
+      <button class="btn primary">保存密码</button>
+    </form>
+  </div>`;
+  $('#fn').onsubmit = async e => {
+    e.preventDefault();
+    const name = new FormData(e.target).get('name').trim();
+    if (name === me.name) return toast('用户名没有变化');
+    try { const r = await API.rename(name); me = r.user; renderNav(); toast(`用户名已改为 ${me.name}`); }
+    catch (err) { toast(err.message); }
+  };
+  $('#fp').onsubmit = async e => {
     e.preventDefault();
     const f = Object.fromEntries(new FormData(e.target));
-    try { await API.password(f.old, f.password); toast('密码已修改'); location.hash = '#/'; }
+    try { await API.password(f.old, f.password); toast('密码已修改'); e.target.reset(); }
     catch (err) { toast(err.message); }
   };
 }
@@ -500,6 +534,7 @@ async function showAdmin() {
       <td>${u.admin ? '<span class="tag">管理员</span>' : u.verified ? '<span class="tag ok">已认证</span>' : '<span class="tag warn">待认证</span>'}</td>
       <td style="text-align:right">${u.admin ? '' : `
         <button class="btn small ${u.verified ? '' : 'primary'}" data-verify="${esc(u.name)}" data-v="${!u.verified}">${u.verified ? '取消认证' : '认证'}</button>
+        <button class="btn small" data-rename="${esc(u.name)}">改名</button>
         <button class="btn small" data-reset="${esc(u.name)}">重置密码</button>`}</td>
     </tr>`).join('')}
     </tbody></table>
@@ -507,7 +542,12 @@ async function showAdmin() {
   </div>`;
   view.onclick = async e => {
     const v = e.target.closest('[data-verify]'), r = e.target.closest('[data-reset]'), x = e.target.closest('#export');
+    const rn = e.target.closest('[data-rename]');
     try {
+      if (rn) {
+        const nn = prompt(`把 ${rn.dataset.rename} 改名为：`, rn.dataset.rename);
+        if (nn && nn.trim() !== rn.dataset.rename) { await API.adminRename(rn.dataset.rename, nn.trim()); toast('已改名'); route(); }
+      }
       if (v) { await API.updateUser(v.dataset.verify, { p_verified: v.dataset.v === 'true' }); toast('已更新'); route(); }
       if (r) {
         const pw = prompt(`为 ${r.dataset.reset} 设置新密码（至少 6 位）：`);

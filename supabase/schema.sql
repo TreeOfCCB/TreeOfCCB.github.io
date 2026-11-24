@@ -96,15 +96,37 @@ begin
   if octet_length(p) > 72 then raise exception '密码过长'; end if;
 end $$;
 
+-- 校验并规整用户名，返回去掉首尾空白后的名字
+create or replace function public._relay_check_name(p text) returns text
+language plpgsql immutable as $$
+declare v text := btrim(coalesce(p, ''));
+begin
+  if char_length(v) not between 2 and 20
+     or v !~ '^[^[:space:][:cntrl:]<>&"''/\\@#?%]+$' then
+    raise exception '用户名需为 2–20 个字符，不能包含空格和特殊符号';
+  end if;
+  return v;
+end $$;
+
+-- 改名：会话和已认领节点的认领者通过外键 on update cascade 一并更新
+create or replace function public._relay_rename(p_old text, p_new text) returns text
+language plpgsql security definer set search_path = public, extensions as $$
+declare v text := _relay_check_name(p_new);
+begin
+  if v = p_old then return v; end if;
+  if exists (select 1 from relay_users where lower(name) = lower(v) and name <> p_old) then
+    raise exception '用户名已被占用';
+  end if;
+  update relay_users set name = v where name = p_old;
+  if not found then raise exception '用户不存在'; end if;
+  return v;
+end $$;
+
 -- ---------------- 账号 ----------------
 create or replace function public.relay_register(p_username text, p_password text) returns json
 language plpgsql security definer set search_path = public, extensions as $$
-declare v_name text := btrim(coalesce(p_username, ''));
+declare v_name text := _relay_check_name(p_username);
 begin
-  if char_length(v_name) not between 2 and 20
-     or v_name !~ '^[^[:space:][:cntrl:]<>&"''/\\@#?%]+$' then
-    raise exception '用户名需为 2–20 个字符，不能包含空格和特殊符号';
-  end if;
   perform _relay_check_password(p_password);
   if exists (select 1 from relay_users where lower(name) = lower(v_name)) then
     raise exception '用户名已被占用';
@@ -152,6 +174,16 @@ begin
   update relay_users set pw_hash = crypt(p_new, gen_salt('bf', 8)) where name = u.name;
   delete from relay_sessions where name = u.name and token_hash <> _relay_hash(p_token);
   return json_build_object('ok', true);
+end $$;
+
+create or replace function public.relay_change_username(p_token text, p_new_name text) returns json
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  u relay_users := _relay_require(p_token);
+  v text := _relay_rename(u.name, p_new_name);
+begin
+  select * into u from relay_users where name = v;
+  return json_build_object('ok', true, 'user', _relay_user_json(u));
 end $$;
 
 -- ---------------- 读取（游客可用） ----------------
@@ -298,6 +330,29 @@ begin
   return json_build_object('ok', true);
 end $$;
 
+create or replace function public.relay_admin_rename_user(p_token text, p_name text, p_new_name text) returns json
+language plpgsql security definer set search_path = public, extensions as $$
+declare v text;
+begin
+  perform _relay_require_admin(p_token);
+  v := _relay_rename(p_name, p_new_name);
+  return json_build_object('ok', true, 'name', v);
+end $$;
+
+-- 管理员修改任意已认领节点（写作中 / 已完成 / 已终止）的标题与正文，不改变状态和认领者
+create or replace function public.relay_admin_save_node(p_token text, p_id bigint, p_title text default null, p_content text default null) returns json
+language plpgsql security definer set search_path = public, extensions as $$
+declare n relay_nodes;
+begin
+  perform _relay_require_admin(p_token);
+  select * into n from relay_nodes where id = p_id for update;
+  if n.id is null or n.state = 'white' then raise exception '该节点还没有被认领，没有可编辑的内容'; end if;
+  if char_length(coalesce(p_content, '')) > 200000 then raise exception '正文超过 200000 字符上限'; end if;
+  update relay_nodes set title = left(coalesce(p_title, n.title), 60), content = coalesce(p_content, n.content), updated_at = now()
+  where id = p_id;
+  return json_build_object('ok', true, 'updatedAt', _relay_ms(now()));
+end $$;
+
 create or replace function public.relay_admin_export(p_token text) returns json
 language plpgsql stable security definer set search_path = public, extensions as $$
 begin
@@ -331,7 +386,8 @@ revoke all on function
   public._relay_ms(timestamptz), public._relay_hash(text), public._relay_user_json(public.relay_users),
   public._relay_me(text), public._relay_require(text), public._relay_new_session(text),
   public._relay_check_password(text), public._relay_lock_yellow(public.relay_users, bigint, boolean),
-  public._relay_require_admin(text), public.relay_bootstrap_admin(text, text)
+  public._relay_require_admin(text), public.relay_bootstrap_admin(text, text),
+  public._relay_check_name(text), public._relay_rename(text, text)
 from public, anon, authenticated;
 
 -- 对外接口
@@ -342,7 +398,9 @@ revoke all on function
   public.relay_claim_node(text, bigint), public.relay_save_node(text, bigint, text, text),
   public.relay_finish_node(text, bigint, text, text, text), public.relay_release_node(text, bigint),
   public.relay_admin_list_users(text), public.relay_admin_update_user(text, text, boolean, text),
-  public.relay_admin_export(text)
+  public.relay_admin_export(text),
+  public.relay_change_username(text, text), public.relay_admin_rename_user(text, text, text),
+  public.relay_admin_save_node(text, bigint, text, text)
 from public;
 grant execute on function
   public.relay_register(text, text), public.relay_login(text, text), public.relay_logout(text),
@@ -351,7 +409,9 @@ grant execute on function
   public.relay_claim_node(text, bigint), public.relay_save_node(text, bigint, text, text),
   public.relay_finish_node(text, bigint, text, text, text), public.relay_release_node(text, bigint),
   public.relay_admin_list_users(text), public.relay_admin_update_user(text, text, boolean, text),
-  public.relay_admin_export(text)
+  public.relay_admin_export(text),
+  public.relay_change_username(text, text), public.relay_admin_rename_user(text, text, text),
+  public.relay_admin_save_node(text, bigint, text, text)
 to anon, authenticated;
 
 -- 让 API 立即识别新函数
